@@ -72,6 +72,7 @@ gb_global Timings global_timings = {0};
 #include "cached.cpp"
 
 #include "linker.cpp"
+#include "cross_libc.cpp"
 #include "bundle_command.cpp"
 
 #include "llvm_backend.cpp"
@@ -434,6 +435,8 @@ enum BuildFlagKind {
 	BuildFlag_NoEscapeAnalysis,
 	BuildFlag_NoAtomicAnalysis,
 	BuildFlag_Linker,
+	BuildFlag_Libc,
+	BuildFlag_LinkMode,
 	BuildFlag_UseSeparateModules,
 	BuildFlag_UseSingleModule,
 	BuildFlag_NoThreadedChecker,
@@ -676,6 +679,208 @@ gb_internal void did_you_mean_flag(String flag) {
 	gb_printf_err("Unknown flag: '%.*s'\n", LIT(flag));
 }
 
+// Prints the libcs which are bundled for a target, as part of the list of the targets
+gb_internal void print_bundled_libcs_of_target(TargetOsKind os, TargetArchKind arch, int name_len) {
+	LibcKind libc = default_bundled_libc(os, arch, Subtarget_Default);
+	char const *libcs = nullptr;
+	switch (libc) {
+	case Libc_Glibc:   libcs = "glibc, musl"; break;
+	case Libc_Mingw:   libcs = "mingw";       break;
+	case Libc_Darwin:  libcs = "libsystem";   break;
+	case Libc_FreeBSD: libcs = "freebsd";     break;
+	case Libc_NetBSD:  libcs = "netbsd";      break;
+	}
+	if (libcs != nullptr) {
+		gb_printf_err("%*s(bundled libc: %s)", gb_max(26 - name_len, 1), "", libcs);
+	}
+}
+
+// -libc:<name>[.<version>]
+gb_internal bool parse_libc_flag(String str) {
+	String name = str;
+	String version = {};
+	isize dot = string_index_byte(str, '.');
+	if (dot >= 0) {
+		name    = substring(str, 0, dot);
+		version = substring(str, dot+1, str.len);
+	}
+
+	LibcKind kind = Libc_Invalid;
+	for (i32 i = Libc_System; i < Libc_COUNT; i++) {
+		if (str_eq_ignore_case(libc_kind_names[i], name)) {
+			kind = cast(LibcKind)i;
+			break;
+		}
+	}
+	if (kind == Libc_Invalid) {
+		return false;
+	}
+
+	build_context.libc_kind = kind;
+	build_context.libc_version = {};
+	build_context.libc_version_given = false;
+	if (dot >= 0) {
+		if (!parse_libc_version(version, &build_context.libc_version)) {
+			return false;
+		}
+		build_context.libc_version_given = true;
+	}
+	return true;
+}
+
+// -target:<arch>-<os>[.<version>][-<abi>[.<version>]]
+//
+// The triples of Zig (`x86_64-linux-gnu.2.28`, `aarch64-macos.13.0-none`) and the usual ones of
+// LLVM and GCC (`x86_64-unknown-linux-musl`, `x86_64-pc-windows-msvc`) are both understood.
+gb_internal bool parse_target_triple(String str) {
+	String parts[4] = {};
+	isize part_count = 0;
+	{
+		String_Iterator it = {str, 0};
+		String part = {};
+		while (string_split_iterator_next(&it, '-', &part)) {
+			if (part_count >= gb_count_of(parts) || part.len == 0) {
+				return false;
+			}
+			parts[part_count++] = part;
+		}
+	}
+	if (part_count >= 3) {
+		// Throw the vendor away
+		String vendors[] = {str_lit("unknown"), str_lit("pc"), str_lit("apple"), str_lit("w64")};
+		for (String const &vendor : vendors) {
+			if (str_eq_ignore_case(parts[1], vendor)) {
+				for (isize i = 1; i+1 < part_count; i++) {
+					parts[i] = parts[i+1];
+				}
+				part_count -= 1;
+				break;
+			}
+		}
+	}
+	if (part_count < 2 || part_count > 3) {
+		return false;
+	}
+
+	struct Alias {
+		char const *name;
+		char const *odin_name;
+	};
+	gb_local_persist Alias arch_aliases[] = {
+		{"x86_64", "amd64"}, {"amd64", "amd64"},
+		{"x86", "i386"}, {"i386", "i386"}, {"i486", "i386"}, {"i586", "i386"}, {"i686", "i386"},
+		{"aarch64", "arm64"}, {"arm64", "arm64"},
+		{"arm", "arm32"}, {"arm32", "arm32"}, {"armv6", "arm32"}, {"armv7", "arm32"}, {"armv7a", "arm32"}, {"armhf", "arm32"},
+		{"riscv64", "riscv64"},
+		{"wasm32", "wasm32"},
+	};
+	gb_local_persist Alias os_aliases[] = {
+		{"linux", "linux"}, {"windows", "windows"},
+		{"macos", "darwin"}, {"macosx", "darwin"}, {"darwin", "darwin"},
+		{"freebsd", "freebsd"}, {"netbsd", "netbsd"}, {"openbsd", "openbsd"},
+		{"wasi", "wasi"}, {"freestanding", "freestanding"},
+	};
+
+	String arch = {};
+	for (Alias const &alias : arch_aliases) {
+		if (str_eq_ignore_case(parts[0], make_string_c(alias.name))) {
+			arch = make_string_c(alias.odin_name);
+			break;
+		}
+	}
+
+	String os_name = parts[1];
+	String os_version = {};
+	{
+		// NOTE: only digits follow the name of an OS, e.g. `freebsd14.0` or `macos.13.0`
+		isize i = 0;
+		while (i < os_name.len && !(os_name[i] >= '0' && os_name[i] <= '9') && os_name[i] != '.') {
+			i++;
+		}
+		os_version = substring(os_name, i, os_name.len);
+		os_name    = substring(os_name, 0, i);
+		if (os_version.len > 0 && os_version[0] == '.') {
+			os_version = substring(os_version, 1, os_version.len);
+		}
+	}
+	String os = {};
+	for (Alias const &alias : os_aliases) {
+		if (str_eq_ignore_case(os_name, make_string_c(alias.name))) {
+			os = make_string_c(alias.odin_name);
+			break;
+		}
+	}
+	if (arch.len == 0 || os.len == 0) {
+		return false;
+	}
+
+	String target_name = concatenate3_strings(permanent_allocator(), os, str_lit("_"), arch);
+	NamedTargetMetrics *target = nullptr;
+	for (isize i = 0; i < gb_count_of(named_targets); i++) {
+		if (named_targets[i].name == target_name) {
+			target = named_targets + i;
+			break;
+		}
+	}
+	if (target == nullptr) {
+		return false;
+	}
+
+	LibcKind    libc = build_context.libc_kind;
+	LibcVersion libc_version = build_context.libc_version;
+	bool        libc_version_given = build_context.libc_version_given;
+	if (part_count == 3) {
+		String abi = parts[2];
+		String abi_version = {};
+		isize dot = string_index_byte(abi, '.');
+		if (dot >= 0) {
+			abi_version = substring(abi, dot+1, abi.len);
+			abi         = substring(abi, 0, dot);
+		}
+
+		if (string_starts_with(abi, str_lit("gnu"))) {
+			libc = os == "windows" ? Libc_Mingw : Libc_Glibc;
+		} else if (string_starts_with(abi, str_lit("musl"))) {
+			libc = Libc_Musl;
+		} else if (abi == "msvc") {
+			libc = Libc_System;
+		} else if (abi == "none" || abi == "eabi" || abi == "eabihf" || abi == "elf") {
+			// the default of the target
+		} else {
+			return false;
+		}
+		// NOTE: Odin only supports the hard float ABI on 32-bit ARM
+		if (arch == "arm32" && os == "linux" && !string_ends_with(abi, str_lit("eabihf"))) {
+			return false;
+		}
+
+		if (dot >= 0) {
+			if (libc != Libc_Glibc || !parse_libc_version(abi_version, &libc_version)) {
+				return false;
+			}
+			libc_version_given = true;
+		} else if (libc != build_context.libc_kind) {
+			libc_version = {};
+			libc_version_given = false;
+		}
+	}
+
+	if (os_version.len != 0) {
+		LibcVersion ignored = {};
+		if (!parse_libc_version(os_version, &ignored)) {
+			return false;
+		}
+		build_context.minimum_os_version_string = os_version;
+		build_context.minimum_os_version_string_given = true;
+	}
+
+	selected_target_metrics = target;
+	build_context.libc_kind = libc;
+	build_context.libc_version = libc_version;
+	build_context.libc_version_given = libc_version_given;
+	return true;
+}
+
 gb_internal bool parse_build_flags(Array<String> args) {
 	auto build_flags = array_make<BuildFlag>(heap_allocator(), 0, BuildFlag_COUNT);
 	add_flag(&build_flags, BuildFlag_Help,                    str_lit("help"),                      BuildFlagParam_None,    Command_all);
@@ -715,6 +920,8 @@ gb_internal bool parse_build_flags(Array<String> args) {
 	add_flag(&build_flags, BuildFlag_NoEscapeAnalysis,        str_lit("no-escape-analysis"),        BuildFlagParam_None,    Command__does_check);
 	add_flag(&build_flags, BuildFlag_NoAtomicAnalysis,        str_lit("no-atomic-analysis"),        BuildFlagParam_None,    Command__does_check);
 	add_flag(&build_flags, BuildFlag_Linker,                  str_lit("linker"),                    BuildFlagParam_String,  Command__does_build);
+	add_flag(&build_flags, BuildFlag_Libc,                    str_lit("libc"),                      BuildFlagParam_String,  Command__does_build);
+	add_flag(&build_flags, BuildFlag_LinkMode,                str_lit("link-mode"),                 BuildFlagParam_String,  Command__does_build);
 	add_flag(&build_flags, BuildFlag_UseSeparateModules,      str_lit("use-separate-modules"),      BuildFlagParam_None,    Command__does_build);
 	add_flag(&build_flags, BuildFlag_UseSingleModule,         str_lit("use-single-module"),         BuildFlagParam_None,    Command__does_build);
 	add_flag(&build_flags, BuildFlag_NoThreadedChecker,       str_lit("no-threaded-checker"),       BuildFlagParam_None,    Command__does_check);
@@ -1334,6 +1541,11 @@ gb_internal bool parse_build_flags(Array<String> args) {
 								}
 							}
 
+							if (!found && string_index_byte(str, '-') >= 0) {
+								// A target triple, e.g. `x86_64-linux-gnu.2.28` or `aarch64-linux-musl`
+								found = parse_target_triple(str);
+							}
+
 							if (!found) {
 							    if (str != "?") {
 									struct DistanceAndTargetIndex {
@@ -1362,8 +1574,12 @@ gb_internal bool parse_build_flags(Array<String> args) {
 								}
 								gb_printf_err("All supported targets:\n");
 								for (isize i = 0; i < gb_count_of(named_targets); i++) {
-									gb_printf_err("\t%.*s\n", LIT(named_targets[i].name));
+									TargetMetrics *tm = named_targets[i].metrics;
+									gb_printf_err("\t%.*s", LIT(named_targets[i].name));
+									print_bundled_libcs_of_target(tm->os, tm->arch, cast(int)named_targets[i].name.len);
+									gb_printf_err("\n");
 								}
+								gb_printf_err("A target can also be given as a triple of <arch>-<os>-<abi>, e.g. x86_64-linux-gnu.2.28 or aarch64-linux-musl\n");
 								bad_flags = true;
 							}
 
@@ -1520,6 +1736,31 @@ gb_internal bool parse_build_flags(Array<String> args) {
 							}
 							break;
 
+
+						case BuildFlag_Libc:
+							GB_ASSERT(value.kind == ExactValue_String);
+							if (!parse_libc_flag(value.value_string)) {
+								gb_printf_err("Invalid option for -libc:<string>. Expected one of the following, which can be followed by a version (e.g. glibc.2.28)\n");
+								gb_printf_err("\tsystem\n");
+								gb_printf_err("\tbundled\n");
+								gb_printf_err("\tglibc\n");
+								gb_printf_err("\tmusl\n");
+								gb_printf_err("\tmingw\n");
+								bad_flags = true;
+							}
+							break;
+
+						case BuildFlag_LinkMode:
+							GB_ASSERT(value.kind == ExactValue_String);
+							if (str_eq_ignore_case(value.value_string, str_lit("static"))) {
+								build_context.link_mode = LinkMode_Static;
+							} else if (str_eq_ignore_case(value.value_string, str_lit("dynamic"))) {
+								build_context.link_mode = LinkMode_Dynamic;
+							} else {
+								gb_printf_err("-link-mode:<string> options are 'static' and 'dynamic'\n");
+								bad_flags = true;
+							}
+							break;
 
 						case BuildFlag_UseSeparateModules:
 							if (build_context.use_single_module) {
@@ -3307,6 +3548,31 @@ gb_internal int print_show_help(String const arg0, String command, String option
 			}
 		}
 
+		if (print_flag("-libc:<string>")) {
+			print_usage_line(2, "Specify the C library to link against, and optionally its version.");
+			print_usage_line(2, "The compiler comes with the C libraries of most of its targets, and builds what it");
+			print_usage_line(2, "needs of them on demand, which allows for a program to be linked for another platform");
+			print_usage_line(2, "without any of its toolchain or libraries being installed. This is the default");
+			print_usage_line(2, "when cross-compiling. It needs `clang` and `lld` to be installed.");
+			print_usage_line(2, "Choices:");
+			print_usage_line(3, "system    Link with the toolchain of the system (the default for a native build).");
+			print_usage_line(3, "bundled   The default bundled C library of the target.");
+			print_usage_line(3, "glibc     The GNU C library, linked dynamically (linux).");
+			print_usage_line(3, "musl      musl, linked statically unless -link-mode:dynamic is used (linux).");
+			print_usage_line(3, "mingw     mingw-w64 with the Universal CRT (windows).");
+			print_usage_line(2, "Examples:");
+			print_usage_line(3, "-libc:glibc.2.28   The program will run on any system with glibc 2.28 or newer.");
+			print_usage_line(3, "-libc:musl         The program is fully static and will run on any distribution.");
+			print_usage_line(2, "The built libraries are cached in the directory of the ODIN_CACHE_DIR environment variable.");
+		}
+
+		if (print_flag("-link-mode:<string>")) {
+			print_usage_line(2, "Specify how the C library gets linked when a bundled one is used, see -libc.");
+			print_usage_line(2, "Choices:");
+			print_usage_line(3, "static");
+			print_usage_line(3, "dynamic");
+		}
+
 		if (print_flag("-lto:<string>")) {
 			print_usage_line(2, "States that the project is to be build with link-time optimizations.");
 			print_usage_line(2, "This also enables '-use-separate-modules' (if not already set) and `-linker:lld");
@@ -3630,6 +3896,8 @@ gb_internal int print_show_help(String const arg0, String command, String option
 			print_usage_line(2, "Examples:");
 				print_usage_line(3, "-target:linux_amd64");
 				print_usage_line(3, "-target:windows_amd64");
+				print_usage_line(3, "-target:x86_64-linux-gnu.2.28   (a triple, with the version of glibc to link against)");
+				print_usage_line(3, "-target:aarch64-linux-musl");
 				print_usage_line(3, "-target:\"?\" for a list");
 		}
 
@@ -4576,8 +4844,8 @@ int main(int arg_count, char const **arg_ptr) {
 	// }
 
 #if !defined(GB_SYSTEM_WINDOWS)
-	if (build_context.metrics.os == TargetOs_windows && build_context.windows_sdk_root.len == 0) {
-		gb_printf_err("-windows-sdk-root:<path> must be used to target Windows\n");
+	if (build_context.metrics.os == TargetOs_windows && build_context.windows_sdk_root.len == 0 && build_context.libc_kind == Libc_System) {
+		gb_printf_err("-windows-sdk-root:<path> must be used to target Windows with -libc:system\n");
 		gb_exit(1);
 	}
 #endif

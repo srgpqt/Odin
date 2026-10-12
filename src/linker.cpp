@@ -10,6 +10,8 @@ struct LinkerData {
 	bool     needs_system_library_linked;
 };
 
+gb_internal i32 cross_linker_stage(LinkerData *gen, String const &output_filename);
+
 gb_internal i32 system_exec_command_line_app(char const *name, char const *fmt, ...);
 gb_internal bool system_exec_command_line_app_output(char const *command, gbString *output);
 
@@ -208,6 +210,10 @@ gb_internal i32 linker_stage(LinkerData *gen) {
 			extra_orca_flags);
 	#endif
 		return result;
+	}
+
+	if (build_context.libc_kind != Libc_System) {
+		return cross_linker_stage(gen, output_filename);
 	}
 
 	bool is_android = false;

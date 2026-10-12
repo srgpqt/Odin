@@ -323,3 +323,6 @@ build/
 cmake-build*/
 CMakeLists.txt
 sandbox/
+
+# The sources of the bundled C libraries have to be kept as they are
+!/libc/**

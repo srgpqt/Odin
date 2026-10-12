@@ -481,6 +481,48 @@ String linker_choices[Linker_COUNT] = {
 	str_lit("mold"),
 };
 
+// The C library (and everything which comes with it: start files, compiler runtime) that
+// a program gets linked against, see `cross_libc.cpp`
+enum LibcKind : i32 {
+	Libc_Invalid = -1,
+	Libc_Default = 0, // `Libc_System` for the host, the bundled libc of the target when cross compiling
+	Libc_System,      // whatever the toolchain of the system links against
+	Libc_Bundled,     // the default bundled libc of the target, only used whilst parsing the flags
+
+	Libc_Glibc,
+	Libc_Musl,
+	Libc_Mingw,
+	Libc_Darwin,      // libSystem
+	Libc_FreeBSD,
+	Libc_NetBSD,
+
+	Libc_COUNT,
+};
+
+String libc_kind_names[Libc_COUNT] = {
+	str_lit("default"),
+	str_lit("system"),
+	str_lit("bundled"),
+	str_lit("glibc"),
+	str_lit("musl"),
+	str_lit("mingw"),
+	str_lit("libsystem"),
+	str_lit("freebsd"),
+	str_lit("netbsd"),
+};
+
+struct LibcVersion {
+	i32 major;
+	i32 minor;
+	i32 patch;
+};
+
+enum LinkModeKind : i32 {
+	LinkMode_Default,
+	LinkMode_Static,
+	LinkMode_Dynamic,
+};
+
 enum SourceCodeLocationInfo : u8 {
 	SourceCodeLocationInfo_Normal = 0,
 	SourceCodeLocationInfo_Obfuscated = 1,
@@ -609,6 +651,11 @@ struct BuildContext {
 	IntegerDivisionByZeroKind integer_division_by_zero_behaviour;
 
 	LinkerChoice linker_choice;
+
+	LibcKind     libc_kind;
+	LibcVersion  libc_version;
+	bool         libc_version_given;
+	LinkModeKind link_mode;
 
 	StringSet custom_attributes;
 
@@ -1796,6 +1843,239 @@ gb_internal void init_build_context_error_pos_style() {
 	}
 }
 
+gb_internal bool parse_libc_version(String str, LibcVersion *version) {
+	i32 parts[3] = {};
+	isize part_count = 0;
+	String_Iterator it = {str, 0};
+	String part = {};
+	while (string_split_iterator_next(&it, '.', &part)) {
+		if (part_count >= 3 || part.len == 0 || part.len > 6) {
+			return false;
+		}
+		i32 n = 0;
+		for (isize i = 0; i < part.len; i++) {
+			if (part[i] < '0' || part[i] > '9') {
+				return false;
+			}
+			n = n*10 + (part[i] - '0');
+		}
+		parts[part_count++] = n;
+	}
+	if (part_count == 0) {
+		return false;
+	}
+	version->major = parts[0];
+	version->minor = parts[1];
+	version->patch = parts[2];
+	return true;
+}
+
+// The libc which is bundled with the compiler for a target, or `Libc_System` if there is none
+gb_internal LibcKind default_bundled_libc(TargetOsKind os, TargetArchKind arch, Subtarget subtarget) {
+	if (subtarget != Subtarget_Default) {
+		return Libc_System;
+	}
+	switch (os) {
+	case TargetOs_linux:
+		switch (arch) {
+		case TargetArch_amd64:
+		case TargetArch_i386:
+		case TargetArch_arm64:
+		case TargetArch_arm32:
+		case TargetArch_riscv64:
+			return Libc_Glibc;
+		}
+		break;
+	case TargetOs_windows:
+		// NOTE: not i386, the runtime of Odin for it defines symbols of the C runtime of MSVC
+		// itself (`_tls_index`) and relies on its 64-bit integer helpers (`int64.lib`)
+		switch (arch) {
+		case TargetArch_amd64:
+			return Libc_Mingw;
+		}
+		break;
+	case TargetOs_darwin:
+		switch (arch) {
+		case TargetArch_amd64:
+		case TargetArch_arm64:
+			return Libc_Darwin;
+		}
+		break;
+	case TargetOs_freebsd:
+		switch (arch) {
+		case TargetArch_amd64:
+		case TargetArch_i386:
+		case TargetArch_arm64:
+			return Libc_FreeBSD;
+		}
+		break;
+	case TargetOs_netbsd:
+		switch (arch) {
+		case TargetArch_amd64:
+		case TargetArch_arm64:
+			return Libc_NetBSD;
+		}
+		break;
+	}
+	return Libc_System;
+}
+
+// Decides which libc the program gets linked against, and how
+gb_internal void init_build_context_libc(BuildContext *bc, TargetOsKind host_os, Subtarget subtarget) {
+	TargetOsKind   os   = bc->metrics.os;
+	TargetArchKind arch = bc->metrics.arch;
+
+	LibcKind requested = bc->libc_kind;
+	LibcKind bundled   = default_bundled_libc(os, arch, subtarget);
+
+	auto const &unsupported = [&](char const *reason) {
+		gb_printf_err("-libc:%.*s cannot be used with the target %.*s_%.*s%s\n",
+			LIT(libc_kind_names[requested]), LIT(target_os_names[os]), LIT(target_arch_names[arch]), reason);
+		gb_exit(1);
+	};
+
+	switch (requested) {
+	case Libc_Default: {
+		// NOTE: only take over the linking when there is no toolchain which could be expected to do it:
+		// the Xcode and MSVC toolchains are able to target all of the architectures of their own platform
+		bool use_bundled = bc->cross_compiling && bundled != Libc_System;
+		if (os == host_os && (os == TargetOs_darwin || os == TargetOs_windows)) {
+			use_bundled = false;
+		}
+		if (os == TargetOs_windows && bc->windows_sdk_root.len != 0) {
+			use_bundled = false;
+		}
+		bc->libc_kind = use_bundled ? bundled : Libc_System;
+		break;
+	}
+	case Libc_System:
+		break;
+	case Libc_Bundled:
+		if (bundled == Libc_System) {
+			unsupported(", there is no bundled libc for it");
+		}
+		bc->libc_kind = bundled;
+		break;
+	case Libc_Musl:
+		if (bundled != Libc_Glibc) {
+			unsupported("");
+		}
+		break;
+	default:
+		if (bundled != requested) {
+			unsupported("");
+		}
+		break;
+	}
+
+	if (bc->libc_kind == Libc_System) {
+		if (bc->libc_version_given) {
+			gb_printf_err("A version of the libc can only be chosen for a libc which is bundled with the compiler\n");
+			gb_exit(1);
+		}
+		if (bc->link_mode != LinkMode_Default) {
+			gb_printf_err("-link-mode needs a libc which is bundled with the compiler, see -libc\n");
+			gb_exit(1);
+		}
+		return;
+	}
+
+	LibcVersion os_version = {};
+	bool os_version_given = false;
+	if (bc->minimum_os_version_string_given && os != TargetOs_darwin) {
+		os_version_given = parse_libc_version(bc->minimum_os_version_string, &os_version);
+		if (!os_version_given) {
+			gb_printf_err("Invalid -minimum-os-version:%.*s\n", LIT(bc->minimum_os_version_string));
+			gb_exit(1);
+		}
+	}
+
+	switch (bc->libc_kind) {
+	case Libc_Glibc:
+		if (!bc->libc_version_given) {
+			// The same defaults as Zig: the targets which traditionally had a 32-bit `time_t`
+			// need glibc 2.34 for all of the 64-bit time support
+			if (arch == TargetArch_i386 || arch == TargetArch_arm32) {
+				bc->libc_version = {2, 34, 0};
+			} else {
+				bc->libc_version = {2, 31, 0};
+			}
+		} else {
+			LibcVersion minimum = {2, 2, 5};
+			switch (arch) {
+			case TargetArch_arm64:   minimum = {2, 17, 0}; break;
+			case TargetArch_riscv64: minimum = {2, 27, 0}; break;
+			case TargetArch_arm32:   minimum = {2, 4,  0}; break;
+			case TargetArch_i386:    minimum = {2, 2,  5}; break;
+			}
+			LibcVersion v = bc->libc_version;
+			if (v.major != minimum.major || v.minor < minimum.minor || (v.minor == minimum.minor && v.patch < minimum.patch)) {
+				gb_printf_err("glibc %d.%d is not supported for the target %.*s_%.*s, the oldest supported version is %d.%d",
+					v.major, v.minor, LIT(target_os_names[os]), LIT(target_arch_names[arch]), minimum.major, minimum.minor);
+				if (minimum.patch != 0) {
+					gb_printf_err(".%d", minimum.patch);
+				}
+				gb_printf_err("\n");
+				gb_exit(1);
+			}
+		}
+		break;
+	case Libc_FreeBSD:
+		if (bc->libc_version_given) {
+			// the version is the one of the OS
+		} else if (os_version_given) {
+			bc->libc_version = os_version;
+		} else {
+			bc->libc_version = {14, 0, 0};
+		}
+		// NOTE: the bundled start files call `__libc_start1`, which libc.so.7 has since FreeBSD 14
+		if (bc->libc_version.major < 14) {
+			gb_printf_err("FreeBSD %d cannot be targeted with the bundled libc, the oldest supported version is 14.0\n", bc->libc_version.major);
+			gb_exit(1);
+		}
+		break;
+	case Libc_NetBSD:
+		if (bc->libc_version_given) {
+			// the version is the one of the OS
+		} else if (os_version_given) {
+			bc->libc_version = os_version;
+		} else {
+			bc->libc_version = {10, 1, 0};
+		}
+		break;
+	case Libc_Darwin:
+		if (bc->libc_version_given) {
+			gb_printf_err("The version of macOS to target is chosen with -minimum-os-version\n");
+			gb_exit(1);
+		}
+		parse_libc_version(bc->minimum_os_version_string, &bc->libc_version);
+		break;
+	default:
+		if (bc->libc_version_given) {
+			gb_printf_err("-libc:%.*s does not have versions to choose from\n", LIT(libc_kind_names[bc->libc_kind]));
+			gb_exit(1);
+		}
+		break;
+	}
+
+	// musl is the only one of the libcs which is able to be linked statically
+	if (bc->link_mode == LinkMode_Default) {
+		bc->link_mode = bc->libc_kind == Libc_Musl ? LinkMode_Static : LinkMode_Dynamic;
+	} else if (bc->link_mode == LinkMode_Static && bc->libc_kind != Libc_Musl) {
+		gb_printf_err("-link-mode:static is not supported with -libc:%.*s", LIT(libc_kind_names[bc->libc_kind]));
+		if (os == TargetOs_linux) {
+			gb_printf_err(", use -libc:musl");
+		}
+		gb_printf_err("\n");
+		gb_exit(1);
+	}
+
+	if (bc->sanitizer_flags != 0) {
+		gb_printf_err("-sanitize is not supported with a bundled libc, the runtimes of the sanitizers are not bundled\n");
+		gb_exit(1);
+	}
+}
+
 gb_internal void init_build_context(TargetMetrics *cross_target, Subtarget subtarget) {
 	BuildContext *bc = &build_context;
 
@@ -1867,6 +2147,8 @@ gb_internal void init_build_context(TargetMetrics *cross_target, Subtarget subta
 			metrics = &target_linux_i386;
 		#endif
 	#endif
+
+	TargetOsKind host_os = metrics->os;
 
 	if (cross_target != nullptr && metrics != cross_target) {
 		bc->different_os = cross_target->os != metrics->os;
@@ -2119,6 +2401,8 @@ gb_internal void init_build_context(TargetMetrics *cross_target, Subtarget subta
 	} else if (selected_subtarget == Subtarget_Android) {
 		init_android_values(bc->build_mode == BuildMode_Executable && (bc->command_kind & Command__does_build) != 0);
 	}
+
+	init_build_context_libc(bc, host_os, subtarget);
 
 	if (!bc->custom_optimization_level) {
 		// NOTE(bill): when building with `-debug` but not specifying an optimization level

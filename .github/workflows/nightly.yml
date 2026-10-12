@@ -35,6 +35,7 @@ jobs:
           cp -r base dist
           cp -r core dist
           cp -r vendor dist
+          cp -r libc dist
           cp -r bin dist
           cp -r examples dist
       - name: Upload artifact
@@ -79,6 +80,7 @@ jobs:
           cp -r base $FILE
           cp -r core $FILE
           cp -r vendor $FILE
+          cp -r libc $FILE
           cp -r examples $FILE
           ./ci/remove_windows_binaries.sh $FILE
           # Creating a tarball so executable permissions are retained, see https://github.com/actions/upload-artifact/issues/38
@@ -125,6 +127,7 @@ jobs:
           cp -r base $FILE
           cp -r core $FILE
           cp -r vendor $FILE
+          cp -r libc $FILE
           cp -r examples $FILE
           ./ci/remove_windows_binaries.sh $FILE
           dylibbundler -b -x $FILE/odin -d $FILE/libs -od -p @executable_path/libs
